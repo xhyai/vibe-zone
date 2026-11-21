@@ -1,8 +1,8 @@
 [package]
 name = "vibe-zone"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
-description = "Fast mini social API for the Vibe Zone DevFest finale (Rust + SQLite, raw epoll)"
+description = "Fast mini social API for the Vibe Zone DevFest finale (Rust + append-only log, raw epoll)"
 license = "MIT"
 
 [[bin]]
@@ -11,17 +11,13 @@ path = "src/main.rs"
 
 [dependencies]
 # Raw epoll/eventfd syscalls for the net loop; no async runtime, no HTTP
-# framework. serde_json stays for request-body parsing only (correctness);
-# all responses are hand-rolled.
+# framework, no JSON library, no database: hand-rolled JSON parsing and
+# an append-only log store keep the binary small and the write path
+# syscall-cheap under the runner's gVisor sandbox.
 libc = "0.2"
-# Drop-in allocator: faster than musl's malloc for the small, short-lived
-# allocations on the request path (serde_json DOM, response buffers).
-mimalloc = "0.1"
-rusqlite = { version = "0.37", features = ["bundled"] }
-serde_json = "1"
 
 [profile.release]
-opt-level = 3
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = true

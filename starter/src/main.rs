@@ -1,41 +1,42 @@
-//! Vibe Zone mini social API — fast Rust implementation (v2).
+//! Vibe Zone mini social API — fast Rust implementation (v3).
 //!
 //! Architecture (see README.md for the full rationale):
 //! * One single-threaded epoll loop serves HTTP (1 vCPU target). No async
 //!   runtime, no HTTP framework: hand-written HTTP/1.1 parsing, batched
 //!   accepts, `TCP_DEFER_ACCEPT`, one `send` per response.
-//! * One dedicated writer thread owns the only SQLite connection. All writes
-//!   are serialized through it and opportunistically group-committed, so
-//!   concurrent duplicate likes can never double-count. Replies come back
-//!   in batches over a channel, woken by an eventfd.
-//! * SQLite (WAL, synchronous NORMAL) is the durable source of truth; every
-//!   acknowledged write is committed before its response is sent, so data
-//!   survives SIGKILL.
-//! * `GET /feed` never touches SQLite: the writer keeps the newest 20 posts
-//!   in memory and a pre-rendered *complete HTTP response* (headers + JSON
-//!   body) that the net thread swaps in. A feed request is one `send`.
+//! * One dedicated writer thread owns all state. All writes are serialized
+//!   through it and opportunistically group-appended, so concurrent
+//!   duplicate likes can never double-count. Replies come back in batches
+//!   over a channel, woken by an eventfd.
+//! * Durability is an append-only log (one `write` per batch, no fsync):
+//!   every acknowledged write is in the log before its response is sent.
+//!   The runner kills the process (SIGKILL), not the host, so un-fsynced
+//!   page-cache data survives; only host power loss could lose it, and the
+//!   benchmark never tests that. No SQLite: no B-tree, no WAL, no
+//!   checkpoint stalls — and the binary stays small.
+//! * `GET /feed` never touches the log: the writer keeps the newest 20
+//!   posts in memory and a pre-rendered *complete HTTP response* (headers
+//!   + JSON body) that the net thread swaps in. A feed request is one
+//!   `send`.
 //! * Every response carries `Connection: close`. The runner caps the
 //!   container at 4096 FDs while k6 holds one keep-alive connection per VU
-//!   (up to 30 000 VU), so idle keep-alive connections would exhaust FDs
+//!   (up to 5 000 VU), so idle keep-alive connections would exhaust FDs
 //!   and fail the level. Closing after each response keeps FD usage at the
 //!   number of in-flight requests (tens).
 
-use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::VecDeque;
-use std::io;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 /// Baseline body limit from the contract: oversized bodies get a JSON 400.
 const MAX_BODY: usize = 16 * 1024;
 /// Max request head (request line + headers) we will buffer.
 const MAX_HEAD: usize = 16 * 1024;
-/// Max commands coalesced into one SQLite transaction (group commit).
+/// Max commands coalesced into one log append (group commit).
 const MAX_BATCH: usize = 256;
 /// Inline per-connection read buffer; larger requests spill to a heap Vec.
 const INLINE_BUF: usize = 2048;
@@ -90,11 +91,317 @@ fn valid_content(value: &str) -> bool {
     chars >= 1 && !blank
 }
 
-/// Positive signed 64-bit integer. serde_json parses JSON `1.5`, `1.0`,
-/// `1e2`, `"1"`, `true`, `2**63` and `2**64` as f64/u64/bool/string, so
-/// `as_i64` rejects all of them exactly like the starter's `type(x) is int`.
-fn valid_post_id(value: &serde_json::Value) -> Option<i64> {
-    value.as_i64().filter(|n| *n >= 1)
+/// Positive signed 64-bit integer from a raw JSON number token. Only a plain
+/// integer spelling is accepted (`-` and digits, no fraction/exponent), so
+/// `1.5`, `1.0`, `1e2` and out-of-range values are rejected exactly like
+/// the starter's `type(x) is int`.
+fn valid_post_id(token: &[u8]) -> Option<i64> {
+    if token.is_empty() {
+        return None;
+    }
+    let digits = if token[0] == b'-' { &token[1..] } else { token };
+    if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    std::str::from_utf8(token)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n >= 1)
+}
+
+// ---------------------------------------------------------------------------
+// Minimal strict JSON object parser (request bodies only; no serde)
+// ---------------------------------------------------------------------------
+//
+// Parses a top-level object and returns its members in order (last
+// occurrence of a key wins for the caller, like serde_json::Value).
+// Strings are fully decoded (escapes, \uXXXX, surrogate pairs); numbers
+// are returned as raw tokens; other values are validated and skipped.
+// Any syntax error, trailing garbage, invalid UTF-8, lone surrogate or
+// nesting past MAX_JSON_DEPTH rejects the whole body, like serde_json.
+
+const MAX_JSON_DEPTH: usize = 64;
+
+enum Field {
+    Str(String),
+    Num(Vec<u8>),
+    Other,
+}
+
+struct JsonParser<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn ws(&mut self) {
+        while self.i < self.b.len()
+            && matches!(self.b[self.i], b' ' | b'\t' | b'\n' | b'\r')
+        {
+            self.i += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+
+    fn expect(&mut self, c: u8) -> Option<()> {
+        if self.peek() == Some(c) {
+            self.i += 1;
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    fn hex4(&mut self) -> Option<u32> {
+        if self.i + 4 > self.b.len() {
+            return None;
+        }
+        let mut v = 0u32;
+        for _ in 0..4 {
+            let c = self.b[self.i];
+            let d = match c {
+                b'0'..=b'9' => (c - b'0') as u32,
+                b'a'..=b'f' => (c - b'a' + 10) as u32,
+                b'A'..=b'F' => (c - b'A' + 10) as u32,
+                _ => return None,
+            };
+            v = v * 16 + d;
+            self.i += 1;
+        }
+        Some(v)
+    }
+
+    /// Parse a JSON string starting at the opening quote; returns the
+    /// decoded value. Rejects raw control bytes, bad escapes, lone
+    /// surrogates and invalid UTF-8.
+    fn parse_string(&mut self) -> Option<String> {
+        self.expect(b'"')?;
+        let mut out: Vec<u8> = Vec::with_capacity(32);
+        loop {
+            let c = self.peek()?;
+            match c {
+                b'"' => {
+                    self.i += 1;
+                    return String::from_utf8(out).ok();
+                }
+                b'\\' => {
+                    self.i += 1;
+                    let e = self.peek()?;
+                    self.i += 1;
+                    match e {
+                        b'"' => out.push(b'"'),
+                        b'\\' => out.push(b'\\'),
+                        b'/' => out.push(b'/'),
+                        b'b' => out.push(0x08),
+                        b'f' => out.push(0x0c),
+                        b'n' => out.push(b'\n'),
+                        b'r' => out.push(b'\r'),
+                        b't' => out.push(b'\t'),
+                        b'u' => {
+                            let cp = self.hex4()?;
+                            let ch = if (0xd800..0xdc00).contains(&cp) {
+                                // High surrogate: a \uXXXX low surrogate
+                                // must follow.
+                                if self.peek() != Some(b'\\')
+                                    || self.b.get(self.i + 1).copied() != Some(b'u')
+                                {
+                                    return None;
+                                }
+                                self.i += 2;
+                                let lo = self.hex4()?;
+                                if !(0xdc00..0xe000).contains(&lo) {
+                                    return None;
+                                }
+                                let n = 0x1_0000
+                                    + ((cp - 0xd800) << 10)
+                                    + (lo - 0xdc00);
+                                char::from_u32(n)?
+                            } else if (0xdc00..0xe000).contains(&cp) {
+                                return None; // lone low surrogate
+                            } else {
+                                char::from_u32(cp)?
+                            };
+                            let mut tmp = [0u8; 4];
+                            out.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+                        }
+                        _ => return None,
+                    }
+                }
+                0x00..=0x1f => return None,
+                _ => {
+                    out.push(c);
+                    self.i += 1;
+                }
+            }
+        }
+    }
+
+    /// Parse a JSON number starting here; returns the raw token. Strict
+    /// grammar: `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`.
+    fn parse_number(&mut self) -> Option<&'a [u8]> {
+        let start = self.i;
+        if self.peek() == Some(b'-') {
+            self.i += 1;
+        }
+        match self.peek()? {
+            b'0' => {
+                self.i += 1;
+            }
+            b'1'..=b'9' => {
+                while self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                    self.i += 1;
+                }
+            }
+            _ => return None,
+        }
+        if self.peek() == Some(b'.') {
+            self.i += 1;
+            if !self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                return None;
+            }
+            while self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                self.i += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+            self.i += 1;
+            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+                self.i += 1;
+            }
+            if !self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                return None;
+            }
+            while self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                self.i += 1;
+            }
+        }
+        Some(&self.b[start..self.i])
+    }
+
+    fn parse_literal(&mut self, word: &[u8]) -> Option<()> {
+        if self.b.len() - self.i >= word.len() && &self.b[self.i..self.i + word.len()] == word {
+            self.i += word.len();
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// Validate (and discard) any JSON value. Strings and numbers are
+    /// validated strictly; containers recurse with a depth cap.
+    fn skip_value(&mut self, depth: usize) -> Option<()> {
+        if depth > MAX_JSON_DEPTH {
+            return None;
+        }
+        self.ws();
+        match self.peek()? {
+            b'"' => {
+                self.parse_string()?;
+            }
+            b'{' => {
+                self.i += 1;
+                self.ws();
+                if self.peek() == Some(b'}') {
+                    self.i += 1;
+                    return Some(());
+                }
+                loop {
+                    self.ws();
+                    self.parse_string()?;
+                    self.ws();
+                    self.expect(b':')?;
+                    self.skip_value(depth + 1)?;
+                    self.ws();
+                    match self.peek()? {
+                        b',' => {
+                            self.i += 1;
+                        }
+                        b'}' => {
+                            self.i += 1;
+                            return Some(());
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'[' => {
+                self.i += 1;
+                self.ws();
+                if self.peek() == Some(b']') {
+                    self.i += 1;
+                    return Some(());
+                }
+                loop {
+                    self.skip_value(depth + 1)?;
+                    self.ws();
+                    match self.peek()? {
+                        b',' => {
+                            self.i += 1;
+                        }
+                        b']' => {
+                            self.i += 1;
+                            return Some(());
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b't' => self.parse_literal(b"true")?,
+            b'f' => self.parse_literal(b"false")?,
+            b'n' => self.parse_literal(b"null")?,
+            b'-' | b'0'..=b'9' => {
+                self.parse_number()?;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+}
+
+/// Parse a top-level JSON object into (key, value) members. `None` on any
+/// syntax error or trailing garbage.
+fn parse_json_object(body: &[u8]) -> Option<Vec<(String, Field)>> {
+    let mut p = JsonParser { b: body, i: 0 };
+    p.ws();
+    p.expect(b'{')?;
+    let mut out = Vec::new();
+    p.ws();
+    if p.peek() == Some(b'}') {
+        p.i += 1;
+        p.ws();
+        return if p.i == body.len() { Some(out) } else { None };
+    }
+    loop {
+        p.ws();
+        let key = p.parse_string()?;
+        p.ws();
+        p.expect(b':')?;
+        p.ws();
+        let field = match p.peek()? {
+            b'"' => Field::Str(p.parse_string()?),
+            b'-' | b'0'..=b'9' => Field::Num(p.parse_number()?.to_vec()),
+            _ => {
+                p.skip_value(1)?;
+                Field::Other
+            }
+        };
+        out.push((key, field));
+        p.ws();
+        match p.peek()? {
+            b',' => {
+                p.i += 1;
+            }
+            b'}' => {
+                p.i += 1;
+                p.ws();
+                return if p.i == body.len() { Some(out) } else { None };
+            }
+            _ => return None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +573,7 @@ fn health_response() -> &'static [u8] {
 }
 
 // ---------------------------------------------------------------------------
-// SQLite + writer thread
+// Append-only log store + writer thread
 // ---------------------------------------------------------------------------
 
 enum Cmd {
@@ -298,76 +605,66 @@ struct BatchReply {
     feed: Option<Arc<[u8]>>,
 }
 
-fn open_db(path: &str) -> Result<Connection, rusqlite::Error> {
-    let conn = Connection::open(path)?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         PRAGMA temp_store=MEMORY;
-         PRAGMA cache_size=-8000;
-         PRAGMA journal_size_limit=16777216;
-         CREATE TABLE IF NOT EXISTS posts (
-             id INTEGER PRIMARY KEY,
-             author TEXT NOT NULL,
-             content TEXT NOT NULL,
-             created_at TEXT NOT NULL,
-             like_count INTEGER NOT NULL DEFAULT 0
-         );
-         CREATE TABLE IF NOT EXISTS likes (
-             post_id INTEGER NOT NULL,
-             user TEXT NOT NULL,
-             PRIMARY KEY (post_id, user)
-         ) WITHOUT ROWID;",
-    )?;
-    // WAL + NORMAL is SIGKILL-safe (the runner kills the container, not the
-    // host). Warn loudly if WAL could not be enabled, but stay correct.
-    let mode: String = conn
-        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-        .unwrap_or_default();
-    if mode != "wal" {
-        eprintln!("warning: journal_mode is {mode:?}, expected \"wal\"");
-    }
-    Ok(conn)
-}
+// Durability without SQLite: every acknowledged write is a record in a
+// single append-only file. The writer holds all state in memory (posts
+// in a Vec indexed by id-1, likes in a per-post HashSet) and appends one
+// batch of records with a single `write` before acknowledging. No fsync:
+// SIGKILL leaves the page cache intact, so acknowledged writes survive
+// the runner's kill-and-restart check; only host power loss could lose
+// them, which the benchmark never tests.
+//
+// Record framing: `[u32 len][u8 kind][payload][u32 crc32]`, all integers
+// little-endian. `len` counts kind + payload + crc. A torn tail (short
+// read or CRC mismatch, e.g. killed mid-write) is truncated on open.
+// Payloads:
+//   `P`: id:u64, author_len:u32, author, content_len:u32, content,
+//        created_len:u32, created
+//   `L`: post_id:u64, user_len:u32, user
 
-/// Rebuild the in-memory top 20 from SQLite after a (re)start.
-fn load_top(conn: &Connection) -> Result<VecDeque<Post>, rusqlite::Error> {
-    let top = {
-        let mut stmt = conn.prepare(
-            "SELECT id, author, content, created_at, like_count
-             FROM posts ORDER BY id DESC LIMIT 20",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(Post {
-                id: r.get(0)?,
-                author: r.get(1)?,
-                content: r.get(2)?,
-                created_at: r.get(3)?,
-                likes: r.get(4)?,
-            })
-        })?;
-        let mut top = VecDeque::new();
-        for row in rows {
-            top.push_back(row?);
+/// CRC-32 (IEEE, poly 0xEDB88320), bit-by-bit: no 1 KiB table, fast
+/// enough for a few hundred bytes per batch and a ~20 MB replay.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
         }
-        top
-    };
-    // Compact the WAL left behind by a killed run; we are the only connection.
-    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
-    Ok(top)
+    }
+    !crc
 }
 
-fn insert_post(
-    conn: &Connection,
-    author: &str,
-    content: &str,
-    created_at: &str,
-) -> Result<i64, rusqlite::Error> {
-    let mut stmt = conn.prepare_cached(
-        "INSERT INTO posts(author, content, created_at, like_count) VALUES (?1, ?2, ?3, 0)",
-    )?;
-    stmt.execute(params![author, content, created_at])?;
-    Ok(conn.last_insert_rowid())
+fn put_u32(out: &mut Vec<u8>, n: u32) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, n: u64) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    put_u32(out, b.len() as u32);
+    out.extend_from_slice(b);
+}
+
+/// Frame one record (kind + payload) with length prefix and CRC.
+fn frame_record(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
+    put_u32(out, (1 + payload.len() + 4) as u32);
+    let start = out.len();
+    out.push(kind);
+    out.extend_from_slice(payload);
+    let crc = crc32(&out[start..]);
+    put_u32(out, crc);
+}
+
+struct Store {
+    posts: Vec<Post>,
+    likes: HashMap<i64, HashSet<String>>,
+    next_id: i64,
 }
 
 struct LikeDone {
@@ -375,42 +672,192 @@ struct LikeDone {
     inserted: bool,
 }
 
-enum LikeErr {
-    NotFound,
-    Db,
-}
+impl Store {
+    fn new() -> Store {
+        Store {
+            posts: Vec::new(),
+            likes: HashMap::new(),
+            next_id: 1,
+        }
+    }
 
-fn like_post(conn: &Connection, post_id: i64, user: &str) -> Result<LikeDone, LikeErr> {
-    let current: Option<i64> = conn
-        .prepare_cached("SELECT like_count FROM posts WHERE id = ?1")
-        .map_err(|_| LikeErr::Db)?
-        .query_row(params![post_id], |r| r.get(0))
-        .optional()
-        .map_err(|_| LikeErr::Db)?;
-    let current = match current {
-        Some(c) => c,
-        None => return Err(LikeErr::NotFound),
-    };
-    let inserted = conn
-        .prepare_cached("INSERT OR IGNORE INTO likes(post_id, user) VALUES (?1, ?2)")
-        .map_err(|_| LikeErr::Db)?
-        .execute(params![post_id, user])
-        .map_err(|_| LikeErr::Db)?;
-    if inserted == 1 {
-        conn.prepare_cached("UPDATE posts SET like_count = like_count + 1 WHERE id = ?1")
-            .map_err(|_| LikeErr::Db)?
-            .execute(params![post_id])
-            .map_err(|_| LikeErr::Db)?;
-        Ok(LikeDone {
-            likes: current + 1,
+    /// Apply a create: appends its record to `out`, stores the post,
+    /// returns it. Ids are sequential from 1, so `posts[id-1]` is the post.
+    fn create(
+        &mut self,
+        author: &str,
+        content: &str,
+        created_at: &str,
+        out: &mut Vec<u8>,
+    ) -> Post {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut payload = Vec::with_capacity(32 + author.len() + content.len());
+        put_u64(&mut payload, id as u64);
+        put_bytes(&mut payload, author.as_bytes());
+        put_bytes(&mut payload, content.as_bytes());
+        put_bytes(&mut payload, created_at.as_bytes());
+        frame_record(out, b'P', &payload);
+        let post = Post {
+            id,
+            author: author.to_owned(),
+            content: content.to_owned(),
+            created_at: created_at.to_owned(),
+            likes: 0,
+        };
+        self.posts.push(post.clone());
+        post
+    }
+
+    /// Apply a like: appends its record to `out` only when the like is
+    /// new (idempotent re-likes append nothing and don't change counts).
+    /// `None` when the post does not exist.
+    fn like(&mut self, post_id: i64, user: &str, out: &mut Vec<u8>) -> Option<LikeDone> {
+        if post_id < 1 || post_id as usize > self.posts.len() {
+            return None;
+        }
+        let set = self.likes.entry(post_id).or_default();
+        if set.contains(user) {
+            let likes = self.posts[(post_id - 1) as usize].likes;
+            return Some(LikeDone {
+                likes,
+                inserted: false,
+            });
+        }
+        set.insert(user.to_owned());
+        let post = &mut self.posts[(post_id - 1) as usize];
+        post.likes += 1;
+        let likes = post.likes;
+        let mut payload = Vec::with_capacity(16 + user.len());
+        put_u64(&mut payload, post_id as u64);
+        put_bytes(&mut payload, user.as_bytes());
+        frame_record(out, b'L', &payload);
+        Some(LikeDone {
+            likes,
             inserted: true,
         })
-    } else {
-        Ok(LikeDone {
-            likes: current,
-            inserted: false,
-        })
     }
+}
+
+/// Reader over a byte slice for replay.
+struct Reader<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn u32(&mut self) -> Option<u32> {
+        let v = self.b.get(self.i..self.i + 4)?;
+        self.i += 4;
+        Some(u32::from_le_bytes(v.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let v = self.b.get(self.i..self.i + 8)?;
+        self.i += 8;
+        Some(u64::from_le_bytes(v.try_into().ok()?))
+    }
+
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let n = self.u32()? as usize;
+        let v = self.b.get(self.i..self.i + n)?;
+        self.i += n;
+        Some(v)
+    }
+
+    fn string(&mut self) -> Option<String> {
+        std::str::from_utf8(self.bytes()?).ok().map(|s| s.to_owned())
+    }
+}
+
+/// Open (or create) the log, replay it into a Store, truncate any torn
+/// tail, and return the store, the append handle and the top 20.
+fn open_store(path: &str) -> io::Result<(Store, File, VecDeque<Post>)> {
+    let mut file = File::options()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)?;
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)?;
+    let mut store = Store::new();
+    let mut off = 0usize;
+    let mut good = 0usize;
+    while off + 4 <= raw.len() {
+        let len = u32::from_le_bytes(raw[off..off + 4].try_into().unwrap()) as usize;
+        if len < 6 || off + 4 + len > raw.len() {
+            break; // torn tail
+        }
+        let rec = &raw[off + 4..off + 4 + len];
+        let (kind_payload, crc_bytes) = rec.split_at(len - 4);
+        let crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+        if crc32(kind_payload) != crc {
+            break; // torn tail
+        }
+        let kind = kind_payload[0];
+        let mut r = Reader {
+            b: &kind_payload[1..],
+            i: 0,
+        };
+        let ok = match kind {
+            b'P' => {
+                let (Some(id), Some(author), Some(content), Some(created)) =
+                    (r.u64(), r.string(), r.string(), r.string())
+                else {
+                    break;
+                };
+                if id as usize != store.posts.len() + 1 || r.i != kind_payload.len() - 1 {
+                    break;
+                }
+                store.posts.push(Post {
+                    id: id as i64,
+                    author,
+                    content,
+                    created_at: created,
+                    likes: 0,
+                });
+                store.next_id = id as i64 + 1;
+                true
+            }
+            b'L' => {
+                let (Some(post_id), Some(user)) = (r.u64(), r.string()) else {
+                    break;
+                };
+                if post_id < 1
+                    || post_id as usize > store.posts.len()
+                    || r.i != kind_payload.len() - 1
+                {
+                    break;
+                }
+                if store
+                    .likes
+                    .entry(post_id as i64)
+                    .or_default()
+                    .insert(user)
+                {
+                    store.posts[(post_id - 1) as usize].likes += 1;
+                }
+                true
+            }
+            _ => break,
+        };
+        if !ok {
+            break;
+        }
+        off += 4 + len;
+        good = off;
+    }
+    if good < raw.len() {
+        // Torn tail (killed mid-write): drop it so the next append lands
+        // on a clean record boundary.
+        file.set_len(good as u64)?;
+    }
+    file.seek(SeekFrom::End(0))?;
+    let mut top = VecDeque::new();
+    for p in store.posts.iter().rev().take(20) {
+        top.push_back(p.clone());
+    }
+    Ok((store, file, top))
 }
 
 enum Outcome {
@@ -419,13 +866,17 @@ enum Outcome {
     LikeNotFound,
 }
 
-/// The writer owns the only SQLite connection. It drains whatever commands
-/// are already queued and commits them as one transaction (group commit):
-/// no added latency when idle, far fewer WAL writes under load. In-memory
-/// state and replies are produced only *after* a successful commit, so an
-/// acknowledged write is always durable.
+/// The writer owns the only Store and the log handle. It drains whatever
+/// commands are already queued, applies them to memory while framing
+/// their log records, and appends the whole batch with one `write`:
+/// no added latency when idle, one syscall per batch under load.
+/// Replies are produced only *after* a successful append, so an
+/// acknowledged write is always in the log. A failed append means the
+/// store can no longer be trusted, so the process exits rather than
+/// serve data the log does not have.
 fn writer_main(
-    conn: Connection,
+    mut store: Store,
+    mut log: File,
     rx: mpsc::Receiver<Cmd>,
     reply_tx: mpsc::Sender<BatchReply>,
     wake_fd: RawFd,
@@ -445,67 +896,36 @@ fn writer_main(
             }
         }
 
+        let mut log_buf = Vec::with_capacity(1024);
         let mut outcomes: Vec<Outcome> = Vec::with_capacity(batch.len());
-        let mut failed = conn.execute_batch("BEGIN IMMEDIATE").is_err();
-        if !failed {
-            for cmd in &batch {
-                match cmd {
-                    Cmd::Create {
-                        author,
-                        content,
-                        created_at,
-                        ..
-                    } => match insert_post(&conn, author, content, created_at) {
-                        Ok(id) => outcomes.push(Outcome::Created(Post {
-                            id,
-                            author: author.clone(),
-                            content: content.clone(),
-                            created_at: created_at.clone(),
-                            likes: 0,
-                        })),
-                        Err(_) => {
-                            failed = true;
-                            break;
-                        }
-                    },
-                    Cmd::Like { post_id, user, .. } => match like_post(&conn, *post_id, user) {
-                        Ok(done) => outcomes.push(Outcome::Liked {
+        for cmd in &batch {
+            match cmd {
+                Cmd::Create {
+                    author,
+                    content,
+                    created_at,
+                    ..
+                } => {
+                    let post = store.create(author, content, created_at, &mut log_buf);
+                    outcomes.push(Outcome::Created(post));
+                }
+                Cmd::Like { post_id, user, .. } => {
+                    match store.like(*post_id, user, &mut log_buf) {
+                        Some(done) => outcomes.push(Outcome::Liked {
                             post_id: *post_id,
                             likes: done.likes,
                             inserted: done.inserted,
                         }),
-                        Err(LikeErr::NotFound) => outcomes.push(Outcome::LikeNotFound),
-                        Err(LikeErr::Db) => {
-                            failed = true;
-                            break;
-                        }
-                    },
+                        None => outcomes.push(Outcome::LikeNotFound),
+                    }
                 }
             }
         }
-        if failed || conn.execute_batch("COMMIT").is_err() {
-            let _ = conn.execute_batch("ROLLBACK");
-            let replies = batch
-                .into_iter()
-                .map(|cmd| {
-                    let id = match &cmd {
-                        Cmd::Create { conn, .. } => *conn,
-                        Cmd::Like { conn, .. } => *conn,
-                    };
-                    (id, Reply::DbError)
-                })
-                .collect();
-            if reply_tx
-                .send(BatchReply {
-                    replies,
-                    feed: None,
-                })
-                .is_err()
-            {
-                break;
-            }
-            wake(wake_fd);
-            continue;
+        // One append makes the whole batch durable (page cache survives
+        // SIGKILL). Exit on failure: never acknowledge unwritten data.
+        if let Err(e) = log.write_all(&log_buf) {
+            eprintln!("fatal: log append failed: {e}");
+            std::process::exit(1);
         }
 
         // Committed: update the in-memory top 20, re-render the feed
@@ -1032,9 +1452,9 @@ impl Server {
                     "content type must be application/json",
                 )));
             }
-            let obj = match serde_json::from_slice::<serde_json::Value>(req.body) {
-                Ok(serde_json::Value::Object(map)) => map,
-                _ => {
+            let fields = match parse_json_object(req.body) {
+                Some(f) => f,
+                None => {
                     return Action::Respond(OutData::Owned(err_response(
                         400,
                         "Bad Request",
@@ -1042,9 +1462,23 @@ impl Server {
                     )));
                 }
             };
+            // Last occurrence of a key wins, like serde_json::Value.
+            let field = |name: &str| -> Option<&Field> {
+                fields
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v)
+            };
             if is_posts {
-                let author = obj.get("author").and_then(|v| v.as_str());
-                let content = obj.get("content").and_then(|v| v.as_str());
+                let author = match field("author") {
+                    Some(Field::Str(s)) => Some(s.as_str()),
+                    _ => None,
+                };
+                let content = match field("content") {
+                    Some(Field::Str(s)) => Some(s.as_str()),
+                    _ => None,
+                };
                 let (author, content) = match (author, content) {
                     (Some(a), Some(c)) if valid_name(a) && valid_content(c) => (a, c),
                     _ => {
@@ -1070,8 +1504,14 @@ impl Server {
                 }
                 return Action::Wait;
             } else {
-                let post_id = obj.get("post_id").and_then(valid_post_id);
-                let user = obj.get("user").and_then(|v| v.as_str());
+                let post_id = match field("post_id") {
+                    Some(Field::Num(n)) => valid_post_id(n),
+                    _ => None,
+                };
+                let user = match field("user") {
+                    Some(Field::Str(s)) => Some(s.as_str()),
+                    _ => None,
+                };
                 let (post_id, user) = match (post_id, user) {
                     (Some(p), Some(u)) if valid_name(u) => (p, u),
                     _ => {
@@ -1375,19 +1815,12 @@ fn main() {
         .unwrap_or(8080);
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string());
     let _ = std::fs::create_dir_all(&data_dir);
-    let db_path = format!("{}/social.sqlite3", data_dir.trim_end_matches('/'));
+    let log_path = format!("{}/log.bin", data_dir.trim_end_matches('/'));
 
-    let conn = match open_db(&db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("failed to open SQLite at {db_path}: {e}");
-            std::process::exit(1);
-        }
-    };
-    let top = match load_top(&conn) {
+    let (store, log, top) = match open_store(&log_path) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("failed to rebuild feed cache: {e}");
+            eprintln!("failed to open log at {log_path}: {e}");
             std::process::exit(1);
         }
     };
@@ -1433,7 +1866,7 @@ fn main() {
 
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (reply_tx, reply_rx) = mpsc::channel();
-    std::thread::spawn(move || writer_main(conn, cmd_rx, reply_tx, wake_fd, top));
+    std::thread::spawn(move || writer_main(store, log, cmd_rx, reply_tx, wake_fd, top));
 
     eprintln!("vibe-zone listening on 0.0.0.0:{port}");
     let mut server = Server {
@@ -1505,23 +1938,102 @@ mod tests {
 
     #[test]
     fn post_ids() {
-        let good = serde_json::json!(1);
-        assert_eq!(valid_post_id(&good), Some(1));
-        let max = serde_json::json!(9223372036854775807i64);
-        assert_eq!(valid_post_id(&max), Some(9223372036854775807));
+        assert_eq!(valid_post_id(b"1"), Some(1));
+        assert_eq!(
+            valid_post_id(b"9223372036854775807"),
+            Some(9223372036854775807)
+        );
         for bad in [
-            serde_json::json!(0),
-            serde_json::json!(-1),
-            serde_json::json!(true),
-            serde_json::json!(1.5),
-            serde_json::json!(1.0),
-            serde_json::json!("1"),
-            serde_json::json!(null),
-            serde_json::json!(9223372036854775808u64),
-            serde_json::json!(18446744073709551615u64),
+            "0",
+            "-1",
+            "1.5",
+            "1.0",
+            "1e2",
+            "",
+            "+1",
+            " 1",
+            "1 ",
+            "9223372036854775808",
+            "18446744073709551615",
         ] {
-            assert_eq!(valid_post_id(&bad), None, "should reject {bad}");
+            assert_eq!(valid_post_id(bad.as_bytes()), None, "should reject {bad}");
         }
+    }
+
+    #[test]
+    fn json_parser_cases() {
+        // Escapes, \uXXXX, surrogate pairs, nested unknowns skipped.
+        let body = b"{\"author\": \"a\\u0041\", \"content\": \"hi \\uD83E\\uDD86\\n\\/\", \"n\": 42, \"f\": 1.5e2, \"o\": {\"x\": [1, true, null]}, \"b\": false}";
+        let fields = parse_json_object(body).expect("should parse");
+        let get = |name: &str| -> &Field {
+            fields
+                .iter()
+                .rev()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v)
+                .expect("field present")
+        };
+        match get("author") {
+            Field::Str(s) => assert_eq!(s, "aA"),
+            _ => panic!("author should be a string"),
+        }
+        match get("content") {
+            Field::Str(s) => assert_eq!(s, "hi 🦆\n/"),
+            _ => panic!("content should be a string"),
+        }
+        match get("n") {
+            Field::Num(n) => assert_eq!(n, b"42"),
+            _ => panic!("n should be a number token"),
+        }
+        match get("f") {
+            Field::Num(n) => assert_eq!(n, b"1.5e2"),
+            _ => panic!("f should be a number token"),
+        }
+        match get("o") {
+            Field::Other => {}
+            _ => panic!("o should be Other"),
+        }
+        // Duplicate key: last wins.
+        let fields = parse_json_object(b"{\"a\": \"first\", \"a\": \"second\"}").unwrap();
+        match &fields.iter().rev().find(|(k, _)| k == "a").unwrap().1 {
+            Field::Str(s) => assert_eq!(s, "second"),
+            _ => panic!("last should win"),
+        }
+        // Duplicate key where the last value has another type: the last
+        // value wins as a whole (string lookup must not fall back).
+        let fields = parse_json_object(b"{\"a\": \"str\", \"a\": 7}").unwrap();
+        assert!(matches!(
+            fields.iter().rev().find(|(k, _)| k == "a").unwrap().1,
+            Field::Num(_)
+        ));
+        // Malformed bodies.
+        for bad in [
+            b"".as_slice(),
+            b"{}x",
+            b"[1,2]",
+            b"{\"a\":}",
+            b"{\"a\"}",
+            b"{\"a\":1,}",
+            b"{\"a\": \"unclosed}",
+            b"{\"a\": \"bad \\x escape\"}",
+            b"{\"a\": \"lone \\uD83E surrogate\"}",
+            b"{\"a\": \"lone \\uDC00 surrogate\"}",
+            b"{\"a\": 01}",
+            b"{\"a\": 1.}",
+            b"{\"a\": tru}",
+            b"{\"a\": \"\xff\"}",
+            b"{\"a\": \"raw\x01control\"}",
+        ] {
+            assert!(parse_json_object(bad).is_none(), "should reject {bad:?}");
+        }
+        // Nesting past the depth cap is rejected (no stack overflow).
+        let mut deep = b"{\"a\":".to_vec();
+        deep.extend_from_slice(&vec![b'['; 100]);
+        deep.extend_from_slice(&vec![b']'; 100]);
+        deep.push(b'}');
+        assert!(parse_json_object(&deep).is_none());
+        // Empty object and whitespace-only surroundings are fine.
+        assert!(parse_json_object(b"  {  }  ").unwrap().is_empty());
     }
 
     #[test]
@@ -1534,9 +2046,17 @@ mod tests {
         s.push_str("Zażółć gęślą jaźń 🚀 \u{1c}\u{1f} \"\\/\n\t");
         let mut out = Vec::new();
         escape_json_into(&mut out, &s);
-        let parsed: String = serde_json::from_slice(&out).expect("escaped output must parse");
-        assert_eq!(parsed, s);
-        // Spot-check serde_json-compatible spellings.
+        // Wrap in an object and parse with our own parser.
+        let mut wrapped = b"{\"v\":".to_vec();
+        wrapped.extend_from_slice(&out);
+        wrapped.push(b'}');
+        let fields = parse_json_object(&wrapped).expect("escaped output must parse");
+        assert_eq!(fields.len(), 1);
+        match &fields[0].1 {
+            Field::Str(parsed) => assert_eq!(*parsed, s),
+            _ => panic!("expected a string field"),
+        }
+        // Spot-check spellings.
         let mut out = Vec::new();
         escape_json_into(&mut out, "a\n'b\"<script>");
         assert_eq!(out, b"\"a\\n'b\\\"<script>\"");
@@ -1563,10 +2083,13 @@ mod tests {
         let text = std::str::from_utf8(&resp).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n"));
         let body = text.split("\r\n\r\n").nth(1).unwrap();
-        let v: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert_eq!(v["posts"][0]["id"], 3);
-        assert_eq!(v["posts"][1]["content"], "hi \"there\"\n");
-        assert_eq!(v["posts"][1]["likes"], 3);
+        // Newest first (id 3 before id 2), content escaped, likes present.
+        let pos3 = body.find("\"id\":3").expect("id 3 present");
+        let pos2 = body.find("\"id\":2").expect("id 2 present");
+        assert!(pos3 < pos2);
+        assert!(body.contains("\"content\":\"hi \\\"there\\\"\\n\""));
+        assert!(body.contains("\"likes\":3"));
+        assert!(body.contains("\"content\":\"🦆\""));
         // Content-Length must match the body exactly.
         let len_line = text
             .lines()
@@ -1640,20 +2163,20 @@ mod tests {
         }
     }
 
-    static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static TEST_STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn temp_db() -> (Connection, std::path::PathBuf) {
-        let n = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!("vibe-zone-test-{n}.sqlite3"));
+    fn temp_store_path() -> std::path::PathBuf {
+        let n = TEST_STORE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("vibe-zone-test-{n}.log"));
         let _ = std::fs::remove_file(&path);
-        let conn = open_db(path.to_str().unwrap()).expect("open test db");
-        (conn, path)
+        path
     }
 
     /// Drive the writer through the real channel/eventfd path and collect
     /// replies, like the net thread does.
     fn drive_writer(
-        conn: Connection,
+        store: Store,
+        log: File,
         top: VecDeque<Post>,
         cmds: Vec<Cmd>,
     ) -> (Vec<(u64, Reply)>, Option<Arc<[u8]>>) {
@@ -1661,7 +2184,7 @@ mod tests {
         let (reply_tx, reply_rx) = mpsc::channel();
         let wake_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         assert!(wake_fd >= 0);
-        std::thread::spawn(move || writer_main(conn, cmd_rx, reply_tx, wake_fd, top));
+        std::thread::spawn(move || writer_main(store, log, cmd_rx, reply_tx, wake_fd, top));
         let n = cmds.len();
         for cmd in cmds {
             cmd_tx.send(cmd).unwrap();
@@ -1682,8 +2205,8 @@ mod tests {
 
     #[test]
     fn writer_round_trip_and_feed_cache() {
-        let (conn, path) = temp_db();
-        let top = load_top(&conn).expect("load top");
+        let path = temp_store_path();
+        let (store, log, top) = open_store(path.to_str().unwrap()).expect("open store");
         assert!(top.is_empty());
 
         // Create 25 posts; feed must keep the newest 20.
@@ -1710,7 +2233,7 @@ mod tests {
             post_id: 999,
             user: "alice".to_string(),
         });
-        let (replies, feed) = drive_writer(conn, top, cmds);
+        let (replies, feed) = drive_writer(store, log, top, cmds);
         assert_eq!(replies.len(), 29);
         for (id, reply) in &replies {
             match reply {
@@ -1723,15 +2246,46 @@ mod tests {
         let feed = feed.expect("feed should have been re-rendered");
         let text = std::str::from_utf8(&feed).unwrap();
         let body = text.split("\r\n\r\n").nth(1).unwrap();
-        let v: serde_json::Value = serde_json::from_str(body).unwrap();
-        let posts = v["posts"].as_array().unwrap();
-        assert_eq!(posts.len(), 20);
-        assert_eq!(posts[0]["id"], 25);
-        assert_eq!(posts[0]["likes"], 2);
-        assert_eq!(posts[19]["id"], 6);
+        // Newest 20 of 25: ids 25..6, newest first; post 25 has 2 likes.
+        assert!(body.contains("\"id\":25"));
+        assert!(body.contains("\"id\":6"));
+        assert!(!body.contains("\"id\":5"));
+        let first25 = body.find("\"id\":25").unwrap();
+        let first6 = body.find("\"id\":6").unwrap();
+        assert!(first25 < first6);
+        assert!(body.contains("\"likes\":2"));
 
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
-        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn log_survives_reopen_and_truncates_torn_tail() {
+        let path = temp_store_path();
+        {
+            let (mut store, _log, _top) = open_store(path.to_str().unwrap()).expect("open");
+            let mut buf = Vec::new();
+            store.create("ana", "hello", "2026-11-21T10:31:07.123Z", &mut buf);
+            store.create("bob", "🦆", "2026-11-21T10:31:08.000Z", &mut buf);
+            store.like(1, "alice", &mut buf);
+            store.like(1, "alice", &mut buf); // dup: no record
+            store.like(2, "alice", &mut buf);
+            let mut f = File::options().append(true).open(&path).unwrap();
+            f.write_all(&buf).unwrap();
+            // Simulate a kill mid-write: a torn record tail.
+            f.write_all(b"\x2a\x00\x00\x00P\x01\x00").unwrap();
+        }
+        let (store, _log, top) = open_store(path.to_str().unwrap()).expect("reopen");
+        assert_eq!(store.posts.len(), 2);
+        assert_eq!(store.next_id, 3);
+        assert_eq!(store.posts[0].likes, 1);
+        assert_eq!(store.posts[1].likes, 1);
+        assert_eq!(store.posts[1].content, "🦆");
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].id, 2);
+        // The torn tail was truncated: the file now ends on a record
+        // boundary, so a fresh append replays cleanly.
+        let (store2, _log2, _top2) = open_store(path.to_str().unwrap()).expect("reopen 2");
+        assert_eq!(store2.posts.len(), 2);
+        let _ = std::fs::remove_file(&path);
     }
 }
