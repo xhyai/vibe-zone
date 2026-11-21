@@ -1,0 +1,31 @@
+[package]
+name = "vibe-zone"
+version = "2.0.0"
+edition = "2021"
+description = "Fast mini social API for the Vibe Zone DevFest finale (Rust + SQLite, raw epoll)"
+license = "MIT"
+
+[[bin]]
+name = "vibe-zone"
+path = "src/main.rs"
+
+[dependencies]
+# Raw epoll/eventfd syscalls for the net loop; no async runtime, no HTTP
+# framework. serde_json stays for request-body parsing only (correctness);
+# all responses are hand-rolled.
+libc = "0.2"
+# Drop-in allocator: faster than musl's malloc for the small, short-lived
+# allocations on the request path (serde_json DOM, response buffers).
+mimalloc = "0.1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+# A panic means the server is dead either way (the net thread is the
+# process; a dead writer thread hangs all writes). Abort: no landing
+# pads, smaller binary, immediate crash instead of a hung server.
+panic = "abort"
