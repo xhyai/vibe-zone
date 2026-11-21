@@ -1,0 +1,27 @@
+[Unit]
+Description=Vibe Zone outbound benchmark agent
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+RequiresMountsFor=/srv/vibe-zone-runner
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vibe-zone-runner
+EnvironmentFile=/etc/vibe-zone-runner.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m bench.pull_agent
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=75
+KillMode=mixed
+UMask=0077
+LimitCORE=0
+LimitNOFILE=4096
+MemoryMax=768M
+TasksMax=128
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,73 @@
+name: vibezone
+x-limits: &limits
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 128
+  mem_limit: 512m
+  memswap_limit: 512m
+  cpus: 1
+  tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777"]
+  logging:
+    driver: json-file
+    options:
+      max-size: "5m"
+      max-file: "2"
+services:
+  web:
+    <<: *limits
+    build:
+      context: ..
+      dockerfile: leaderboard/Dockerfile
+      target: web
+    image: vibezone-web:local
+    user: "10001:10001"
+    ports:
+      - "127.0.0.1:${LEADERBOARD_PORT:-8081}:8080"
+    environment:
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      BENCH_SMOKE: ${BENCH_SMOKE:-0}
+      BENCH_ALLOWED_IMAGE_IDS: ${BENCH_ALLOWED_IMAGE_IDS:-}
+      COOKIE_SECURE: "0"
+    volumes:
+      - board-data:/data
+    restart: unless-stopped
+    networks: [board]
+  scheduler:
+    <<: *limits
+    build:
+      context: ..
+      dockerfile: leaderboard/Dockerfile
+      target: runner
+    profiles: [runner]
+    network_mode: none
+    image: vibezone-leaderboard:local
+    user: "10001:${DOCKER_GID:-0}"
+    stop_grace_period: 60s
+    command: ["python", "-m", "leaderboard.worker"]
+    healthcheck:
+      disable: true
+    environment:
+      BENCH_ALLOWED_IMAGE_IDS: ${BENCH_ALLOWED_IMAGE_IDS:-}
+      BENCH_VOLUME_DRIVER: ${BENCH_VOLUME_DRIVER:-}
+      BENCH_VOLUME_OPTIONS: ${BENCH_VOLUME_OPTIONS:-}
+      BENCH_HOST_PROFILE: ${BENCH_HOST_PROFILE:-local-unverified}
+      BENCH_SMOKE: ${BENCH_SMOKE:-0}
+      BENCH_SUBNET: ${BENCH_SUBNET:-}
+    volumes:
+      - board-data:/data
+      - board-results:/results
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  board-data:
+  board-results:
+networks:
+  board:
+    ipam:
+      config:
+        - subnet: ${BOARD_SUBNET:-10.231.41.0/24}
