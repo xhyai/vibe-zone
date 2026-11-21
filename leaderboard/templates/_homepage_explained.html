@@ -1,0 +1,19 @@
+<section class="explain-score" aria-labelledby="score-title"><div><h2 id="score-title">{{ t('Ilu użytkowników obsłuży Twoja aplikacja?') }}</h2><p>{{ t('Dokładamy użytkowników i mierzymy czas odpowiedzi. p99 poniżej 500 ms oznacza, że 99% odpowiedzi mieści się w pół sekundy. Zaliczenie wymaga też zera błędów i poprawnych danych.') }}</p><p>{{ t('Ostatni zaliczony poziom to wynik próby. Wynik U zespołu jest środkowym wynikiem z trzech prób, czyli medianą.') }}</p><a href="/start#ai-pilot">{{ t('Nie programujesz? Zacznij od AI Pilot.') }}</a></div>{% include '_load_chart.html' %}</section>
+<section class="api-examples" aria-labelledby="build-title"><h2 id="build-title">{{ t('Co budujesz') }}</h2><p>{{ t('Mały serwis z postami i polubieniami. Aplikacja przyjmuje żądania i zwraca JSON, czyli dane tekstowe o ustalonej strukturze.') }}</p><div class="api-example-grid">
+<article><h3>POST /posts</h3><p>{{ t('Dodaj post') }}</p><pre><code>{"author":"user_42",
+ "content":"Hello DevFest"}</code></pre><p>{{ t('Odpowiedź') }}: 201</p><pre><code>{"id":1,"author":"user_42",
+ "content":"Hello DevFest",
+ "created_at":"2026-11-21T10:31:07.123Z",
+ "likes":0}</code></pre></article>
+<article><h3>POST /like</h3><p>{{ t('Polub post') }}</p><pre><code>{"post_id":1,"user":"user_7"}</code></pre><p>{{ t('Odpowiedź') }}: 200</p><pre><code>{"post_id":1,
+ "likes":1,"liked":true}</code></pre></article>
+<article><h3>GET /feed</h3><p>{{ t('Pobierz najnowsze posty, bez treści żądania') }}</p><p>{{ t('Odpowiedź') }}: 200</p><pre><code>{"posts":[
+ {"id":1,"author":"user_42",
+  "content":"Hello DevFest",
+  "created_at":"2026-11-21T10:31:07.123Z",
+  "likes":1}
+]}</code></pre></article>
+</div><a href="https://github.com/bsisduck/vibe-zone/blob/main/docs/API.md">{{ t('Pełny kontrakt API') }}</a></section>
+<section class="glossary"><h2>{{ t('Słowniczek') }}</h2><details><summary>{{ t('U, VU, p99 i pozostałe skróty') }}</summary><dl>
+{% for term, description in glossary %}<dt>{{ t(term) if term == "Trwałość zapisu" else term }}</dt><dd>{{ t(description) }}</dd>{% endfor %}
+</dl></details></section>

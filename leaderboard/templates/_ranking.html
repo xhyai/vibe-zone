@@ -1,0 +1,19 @@
+{% from "_metrics.html" import metric with context %}
+<section class="scoreboard" aria-labelledby="ranking-title" data-live-board data-limit="{{ limit or 0 }}" data-compact="{{ '1' if compact or kiosk else '0' }}">
+  {% if board.profiles %}<nav class="profile-choice" aria-label="{{ t('Wybierz profil wyników') }}">{% for profile in board.profiles %}<a href="{{ request.path }}?lang={{ lang }}&amp;profile={{ profile.profile_hash }}" {% if profile.profile_hash == board.selected_profile %}aria-current="true"{% endif %}>{{ profile.name }} ({{ profile.profile_hash[:8] }})</a> {% endfor %}</nav>{% endif %}
+  <div class="section-head"><h2 id="ranking-title">{{ t("Ranking") }}{% if limit %} · Top {{ limit }}{% endif %}</h2><span id="refresh-status" role="status">{{ t("Odświeżanie co 10 s") }}</span></div>
+  <p class="scoring">{{ t("Wygrywa najwyższy poziom użytkowników z") }} <strong>{{ t("0% błędów") }}</strong> {{ t("i") }} <strong>p99 &lt; 500 ms</strong>{{ t(". Remis: mniejszy obraz, szybszy start, niższe p99.") }}</p>
+  <dl class="board-summary">
+<div><dt>{{ t("Zespoły") }}</dt><dd data-summary="teams">{{ board.summary.teams if board.summary.teams is not none else "-" }}</dd></div><div><dt>{{ t("Zgłoszenia") }}</dt><dd data-summary="submissions">{{ board.summary.submissions if board.summary.submissions is not none else "-" }}</dd></div><div><dt>{{ t("Opublikowane batche") }}</dt><dd data-summary="batches">{{ board.summary.batches if board.summary.batches is not none else "-" }}</dd></div><div><dt>{{ t("Najlepsze U teraz") }}</dt><dd data-summary="best_vus">{{ board.summary.best_vus if board.summary.best_vus is not none else "-" }}</dd></div></dl>
+  <div class="table-scroll" tabindex="0" role="region" aria-label="{{ t('Tabela rankingu') }}">
+    <table><thead><tr><th scope="col">{{ t("Miejsce / zespół") }}</th><th scope="col" class="number">{{ t("Użytkownicy: U (VU)") }}</th><th scope="col" class="number">{{ t("Obraz") }}</th><th scope="col" class="number">{{ t("Start") }}</th><th scope="col" class="number">p99</th><th scope="col" class="number">req/s</th>
+    {% if not compact and not kiosk %}<th scope="col" class="number">p95</th><th scope="col" class="number">{{ t("Błędy") }}</th><th scope="col" class="number">{{ t("Pomiary / zakres U") }}</th>{% endif %}</tr></thead>
+    <tbody id="ranking-rows">{% for row in (board.ranking[:limit] if limit else board.ranking) %}{% include "_ranking_row.html" %}{% endfor %}
+    {% if not board.ranking %}<tr><td colspan="{{ 6 if compact or kiosk else 9 }}" class="empty">{{ t("Czekamy na pierwszy wynik.") }}</td></tr>{% endif %}
+    </tbody></table>
+  </div>
+  <div class="update-bar"><span>{{ t("Ostatnia publikacja:") }} <strong id="last-update" data-time="{{ board.last_update or '' }}">{{ board.last_update|warsaw_time }}</strong></span><span>{{ t("Następny batch:") }} <strong id="next-update" data-time="{{ board.next_update }}">{{ board.next_update|warsaw_time }}</strong></span><span id="batch-status">{% if board.running %}{{ t("Trwa pomiar") }}{% elif board.requested %}{{ t("Batch w kolejce") }}{% endif %}</span></div>
+  <details id="rejected-panel" {% if not board.rejected %}hidden{% endif %}><summary>{{ t("Rozwiązania, które nie przeszły testów") }}</summary><ul id="rejected-list">{% for row in board.rejected %}<li><strong>{{ row.nickname }}</strong>: {{ row.result.error }}</li>{% endfor %}</ul></details>
+</section>
+
+{% include "_extras.html" %}

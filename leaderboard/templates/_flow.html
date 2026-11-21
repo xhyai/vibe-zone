@@ -1,0 +1,12 @@
+<svg class="flow-diagram" viewBox="0 0 420 440" role="img" aria-labelledby="flow-title flow-desc">
+  <title id="flow-title">{{ t('Jak to działa') }}</title>
+  <desc id="flow-desc">{{ t('Ty i AI przygotowujecie aplikację. Runner sprawdza ją pod obciążeniem, a wynik trafia do rankingu i na ekran strefy.') }}</desc>
+  <path class="flow-track" d="M26 38V408" />
+  {% for label, detail in [('Ty + AI', 'Pomysł i zmiany w kodzie'), ('Fork startera', 'Twoja kopia projektu'), ('Obraz Docker', 'Aplikacja gotowa do uruchomienia'), ('Zgłoszenie', 'Link i zatwierdzenie organizatora'), ('Runner', 'Izolowany kontener, k6 generuje ruch'), ('Wynik U', 'Trzy pomiary, mediana'), ('Leaderboard / ekran strefy', 'Porównaj wynik w swoim profilu')] %}
+  <g transform="translate(0 {{ loop.index0 * 60 }})">
+    <circle cx="26" cy="26" r="17" /><text class="flow-number" x="26" y="32" text-anchor="middle">{{ loop.index }}</text>
+    <text x="56" y="25" class="flow-label">{{ t(label) }}</text><text x="56" y="47" class="flow-detail">{{ t(detail) }}</text>
+    {% if not loop.last %}<path class="flow-arrow" d="M21 51L26 57L31 51" />{% endif %}
+  </g>
+  {% endfor %}
+</svg>

@@ -1,0 +1,19 @@
+<figure class="load-chart">
+  <svg viewBox="0 0 480 300" role="img" aria-labelledby="load-title load-desc">
+    <title id="load-title">{{ t('Użytkownicy i czas odpowiedzi') }}</title>
+    <desc id="load-desc">{{ t('Ostatni zaliczony poziom') }}: U = {{ chart.score }}. {{ t('Próg p99: 500 ms. Wartości są także w tabeli pod wykresem.') }}</desc>
+    <path class="chart-axis" d="M60 30V240H450" />
+    <text x="60" y="20">p99 (ms)</text>
+    <path class="chart-threshold" d="M60 {{ chart.threshold }}H450" />
+    <text x="65" y="{{ chart.threshold - 8 }}">500 ms</text>
+    <polyline class="chart-line" points="{{ chart.line }}" />
+    {% for point in chart.points %}
+    <circle class="{{ 'chart-pass' if point.passed else 'chart-fail' }}" cx="{{ point.x }}" cy="{{ point.y }}" r="{{ 7 if point.vus == chart.score else 5 }}" />
+    {% if point.vus == chart.score %}<text class="chart-score" x="{{ point.x }}" y="{{ point.y - 16 }}" text-anchor="middle">U = {{ chart.score }}</text>{% endif %}
+    {% if loop.first or loop.last or point.vus == chart.score %}<text x="{{ point.x }}" y="263" text-anchor="middle">{{ point.vus }}</text>{% endif %}
+    {% endfor %}
+    <text x="255" y="290" text-anchor="middle">{{ t('Poziomy użytkowników (VU)') }}</text>
+  </svg>
+  <figcaption>{% if chart.repetition %}{{ t('Dane zespołu: próba') }} {{ chart.repetition }} {{ t('z 3, której U jest medianą.') }}{% else %}<strong>{{ t('Przykład, nie wynik zespołu.') }}</strong>{% endif %} {{ t('Poziomy na osi są kolejnymi krokami testu. Zielony punkt: zaliczone. Czerwony: niezaliczone.') }}</figcaption>
+  <details><summary>{{ t('Dane wykresu') }}</summary><table><thead><tr><th>{{ t('Użytkownicy (VU)') }}</th><th>p99 (ms)</th><th>{{ t('Wynik') }}</th></tr></thead><tbody>{% for point in chart.points %}<tr><td>{{ point.vus }}</td><td>{{ point.latency }}</td><td>{{ t('zaliczone') if point.passed else t('niezaliczone') }}</td></tr>{% endfor %}</tbody></table></details>
+</figure>

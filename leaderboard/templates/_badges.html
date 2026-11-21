@@ -1,0 +1,1 @@
+{% if row %}<div class="badges">{% for badge in row.badges %}<span class="badge">{{ t(badge_labels[badge]) }}</span>{% endfor %}</div>{% if row.extras.hidden %}<small class="checks">{{ t('Ukryte testy') }}: {% if row.extras.hidden.total %}{{ row.extras.hidden.passed }}/{{ row.extras.hidden.total }}{% else %}{{ t('brak wyniku') }}{% endif %}</small>{% endif %}{% endif %}

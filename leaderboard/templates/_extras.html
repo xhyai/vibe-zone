@@ -1,0 +1,5 @@
+<section class="extras-panel" aria-label="{{ t('Dodatkowe kategorie') }}">
+<div id="bonus-announcement" class="rules-strip" {% if not board.extras.bonus %}hidden{% endif %}><h2>{{ t('Bonus') }}</h2><pre id="bonus-spec">{{ board.extras.bonus[lang] if board.extras.bonus else '' }}</pre></div>
+<div id="pilot-ranking" {% if not board.extras.features.ai_pilot %}hidden{% endif %}><h2>AI Pilot: Fastest to green</h2><p>{{ t('Czas od wydania zaproszenia do zgłoszenia, które zaliczyło publiczne i ukryte testy smoke.') }}</p><ol id="pilot-results">{% for entry in board.extras.pilot %}<li><a href="/team/{{ entry.id }}">{{ entry.nickname }}</a>: {{ '%.1f'|format(entry.elapsed_seconds) }} s</li>{% else %}<li>{{ t('Czekamy na pierwszy wynik.') }}</li>{% endfor %}</ol></div>
+<p id="vote-link" {% if not board.extras.features.voting %}hidden{% endif %}><a href="/vote">{{ t('Głosowanie publiczności') }}</a></p>
+</section>
