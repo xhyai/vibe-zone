@@ -1,0 +1,4 @@
+{% extends "base.html" %}
+{% block content %}<section class="wrap message"><h1>{{ t("Zgłoszenie zapisane") }}</h1><p>{{ t("Numer") }} {{ submission_id }}{{ t(". Organizator musi zatwierdzić obraz tej wersji przed pomiarem.") }}</p>
+{% if token %}<h2>{{ t("Zachowaj kod zespołu") }}</h2><p>{{ t("Ten kod pozwala podmieniać zgłoszenie. Pokazujemy go tylko teraz.") }}</p><code class="team-code">{{ token }}</code>{% else %}<p>{{ t("Twoje poprzednie zgłoszenie pozostaje w historii. Nowa wersja wymaga ponownego zatwierdzenia.") }}</p>{% endif %}
+<a class="button" href="/leaderboard">{{ t("Wróć do rankingu") }}</a></section>{% endblock %}

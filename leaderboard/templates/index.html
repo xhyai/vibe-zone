@@ -1,0 +1,4 @@
+{% extends "base.html" %}
+{% block title %}{{ t("Ranking") }} · Vibe Zone{% endblock %}
+{% block content %}<section class="hero"><div class="wrap hero-content"><div><h1>{{ 'Vibe Zone' if kiosk else t("Ranking") }}<span aria-hidden="true">{ }</span></h1><p>{{ t("Konkurs mini social API") }}</p></div><div class="challenge"><strong>1 vCPU / 2 GB</strong><span>Mini social API · SQLite</span><span>{{ t("Dowolny język programowania") }}</span></div></div></section>
+<div class="wrap">{% include "_ranking.html" %}{% if not kiosk %}{% include "_method.html" %}<p class="page-actions"><a class="button" href="/submit">{{ t("Zgłoś rozwiązanie") }}</a> <a href="/start">{{ t("Jak zacząć") }}</a></p>{% endif %}</div>{% endblock %}

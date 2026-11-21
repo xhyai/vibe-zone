@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}{{ t("Zgłoś rozwiązanie") }} · Vibe Zone{% endblock %}
+{% block content %}<div class="wrap form-page">  <div class="participate">
+    <section class="submission-form" aria-labelledby="submit-title">
+      <h1 id="submit-title">{{ t("Dołącz do gry") }}</h1><p>{{ t("Podaj publiczny obraz Docker lub repozytorium. Organizator zatwierdzi konkretny obraz przed pomiarem.") }}</p>
+      <p><a href="/start">{{ t('Zasady i instrukcja uczestnika') }}</a></p>
+      {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+      <form action="/submissions" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="nickname">{{ t("Nick lub nazwa zespołu") }}</label><input id="nickname" name="nickname" required maxlength="48" autocomplete="organization" value="{{ values.nickname if values else '' }}" placeholder="{{ t('np. SQLite Surfers') }}">
+        <label for="source">{{ t("Obraz Docker lub adres repozytorium") }}</label><input id="source" name="source" required maxlength="255" spellcheck="false" autocapitalize="none" value="{{ values.source if values else '' }}" placeholder="{{ t('ghcr.io/zespol/social:latest') }}">
+        <label for="language">{{ t('Język rozwiązania') }}</label><input id="language" name="language" maxlength="40" value="{{ values.language if values else '' }}">
+        {% if board.extras.features.prompt_logs %}<label for="prompt-log">{{ t('Publiczny prompt log (opcjonalnie)') }}</label><input id="prompt-log" name="prompt_log" type="url" maxlength="500" value="{{ values.prompt_log if values else '' }}"><small>{{ t('HTTPS: repozytorium lub gist w GitHub albo GitLab. Usuń z logu dane osobowe i sekrety.') }}</small><label for="ai-tool">{{ t('Narzędzie AI (opcjonalnie)') }}</label><input id="ai-tool" name="ai_tool" maxlength="80" value="{{ values.ai_tool if values else '' }}">{% endif %}
+        <label for="invite-code">{{ t("Zaproszenie od organizatora") }} <span>{{ t("przy pierwszym zgłoszeniu") }}</span></label><input id="invite-code" name="invite_code" type="password" autocomplete="off">
+        <label for="team-token">{{ t("Kod zespołu") }} <span>{{ t("przy aktualizacji zgłoszenia") }}</span></label><input id="team-token" name="team_token" type="password" autocomplete="off" aria-describedby="token-help"><small id="token-help">{{ t("Przy pierwszym zgłoszeniu zostaw puste. Otrzymasz kod do kolejnych aktualizacji.") }}</small>
+        <button type="submit">{{ t("Zgłoś rozwiązanie") }}</button>
+      </form>
+      <p class="fine-print">{{ t("Linux/amd64 · port 8080 · dane w /data") }}<br>{{ t("Obraz poniżej 100 MB bez kompresji. Cel: poniżej 50 MB.") }}</p>
+    </section>
+    <section class="submissions" aria-labelledby="submissions-title"><h2 id="submissions-title">{{ t("Na starcie") }}</h2><p>{{ t("Zatwierdzone, najnowsze zgłoszenie każdego zespołu trafia do następnego batcha. Wyniki publikujemy po zakończeniu całej serii trzech pomiarów.") }}</p>
+      <ol id="submission-list" class="submission-list">{% for entry in board.submissions %}<li><div><strong>{{ entry.nickname }}</strong><span>{{ (t('zatwierdzone') if entry.approved_image else t('oczekuje na organizatora')) if entry.current else t('poprzednie') }}</span></div><code>{{ entry.source }}</code></li>{% else %}<li class="empty">{{ t("Lista czeka na pierwszy zespół.") }}</li>{% endfor %}</ol>
+    </section>
+  </div>
+</div>{% endblock %}

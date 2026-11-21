@@ -1,0 +1,2 @@
+{% extends "base.html" %}
+{% block content %}<section class="wrap message"><h1>{{ t("Jednorazowe zaproszenie") }}</h1><p>{{ t("Przekaż ten kod jednemu zespołowi. Pozwala utworzyć pierwsze zgłoszenie. Kod pokazujemy tylko teraz.") }}</p><code class="invite-code">{{ token }}</code><p><a href="/admin">{{ t("Wróć do panelu organizatora") }}</a></p></section>{% endblock %}

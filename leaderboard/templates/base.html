@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="{{ lang }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{{ t('Konkurs API na DevFest Warsaw 2026. Starter, instrukcja, zgłoszenia i wyniki zespołów.') }}">
+  <meta name="theme-color" content="#1a4bcf">
+  <title>{% block title %}Vibe Zone · DevFest Warsaw 2026{% endblock %}</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg', v=asset_hash) }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v=asset_hash) }}">
+  {% if request.endpoint in ['index', 'leaderboard', 'screen', 'team'] %}<script src="{{ url_for('static', filename='board.js', v=asset_hash) }}" defer></script>{% endif %}
+</head>
+<body class="{% if kiosk %}kiosk{% endif %}">
+  <a class="skip-link" href="#main">{{ t("Przejdź do treści") }}</a>
+  <header class="site-header wrap">
+    <a class="brand" href="/" aria-label="{{ t('DevFest Warsaw, strona główna') }}"><span class="brackets" aria-hidden="true">&lt; &gt;</span> DevFest <strong>Warsaw</strong></a>
+    {% if not kiosk %}<nav class="primary-nav" aria-label="{{ t('Nawigacja') }}">
+      {% for path, label in [('/start', 'Jak zacząć'), ('/leaderboard', 'Ranking'), ('/submit', 'Zgłoś rozwiązanie'), ('/screen', 'Widok na ekran')] %}<a href="{{ path }}" {% if request.path == path %}aria-current="page"{% endif %}>{{ t(label) }}</a>{% endfor %}
+    </nav>{% endif %}
+    <nav class="languages" aria-label="Language / Język"><a href="{{ language_path }}?lang=pl" lang="pl" hreflang="pl" {% if lang == 'pl' %}aria-current="true"{% endif %}>PL</a><a href="{{ language_path }}?lang=en" lang="en" hreflang="en" {% if lang == 'en' %}aria-current="true"{% endif %}>EN</a></nav>
+  </header>
+  {% if smoke or remote_enabled %}<aside class="wrap test-banner" {% if not smoke %}hidden{% endif %}><strong>{{ t('Wyniki testowe - poza konkursem') }}</strong><p>{{ t('Wyniki próbne. Oficjalny host i profil wybiera organizator w dniu wydarzenia.') if remote_enabled else t('Smoke: 2 / 5 / 10 użytkowników, 256 MiB RAM. Pełny konkurs wymaga osobnego runnera.') }}</p></aside>{% endif %}
+  {% if request.endpoint in ['index', 'leaderboard', 'screen', 'team'] %}<div id="translations" data-messages='{{ js_messages | tojson }}' data-badges='{{ badge_labels | tojson }}' hidden></div>{% endif %}
+  <main id="main" tabindex="-1">{% block content %}{% endblock %}</main>
+  <footer class="wrap">Vibe Zone / GDG Warsaw <span>{{ t("Konkurs API") }}</span></footer>
+</body>
+</html>
