@@ -1,0 +1,11 @@
+{
+    skip_install_trust
+    default_sni {$DOMAIN:devfest.atlasapx.pl}
+}
+
+{$DOMAIN:devfest.atlasapx.pl} {
+    tls internal
+    encode zstd gzip
+    header Strict-Transport-Security "max-age=31536000"
+    reverse_proxy web:8080
+}
